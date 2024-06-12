@@ -361,6 +361,7 @@ class BasicTransformerBlock(nn.Module):
         if self.attn2 is not None:
             if self.use_ada_layer_norm:
                 norm_hidden_states = self.norm2(hidden_states, timestep)
+                r
             elif self.use_ada_layer_norm_zero or self.use_layer_norm:
                 norm_hidden_states = self.norm2(hidden_states)
             elif self.use_ada_layer_norm_single:

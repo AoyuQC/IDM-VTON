@@ -1891,3 +1891,422 @@ class StableDiffusionXLInpaintPipeline(
         return (image,)
 
         # return StableDiffusionXLPipelineOutput(images=image)
+
+class InputsEncoder():
+    def __init__(
+        self,
+        vae: AutoencoderKL,
+        text_encoder: CLIPTextModel,
+        text_encoder_2: CLIPTextModelWithProjection,
+        tokenizer: CLIPTokenizer,
+        tokenizer_2: CLIPTokenizer,
+        image_encoder: CLIPVisionModelWithProjection = None,
+    ):
+        self.text_encoder = text_encoder
+        self.text_encoder_2 = text_encoder_2
+        self.tokenizer = tokenizer
+        self.tokenizer = tokenizer
+        self.tokenizer_2 = tokenizer_2
+        self.vae = vae
+        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+        self.mask_processor = VaeImageProcessor(
+            vae_scale_factor=self.vae_scale_factor, do_normalize=False, do_binarize=True, do_convert_grayscale=True
+        )
+        self.image_encoder = image_encoder
+
+    def encode_prompt(
+        self,
+        prompt: str,
+        prompt_2: Optional[str] = None,
+        device: Optional[torch.device] = None,
+        num_images_per_prompt: int = 1,
+        do_classifier_free_guidance: bool = True,
+        negative_prompt: Optional[str] = None,
+        negative_prompt_2: Optional[str] = None,
+        prompt_embeds: Optional[torch.FloatTensor] = None,
+        negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+        pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+        negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+        lora_scale: Optional[float] = None,
+        clip_skip: Optional[int] = None,
+    ):
+        r"""
+        Encodes the prompt into text encoder hidden states.
+
+        Args:
+            prompt (`str` or `List[str]`, *optional*):
+                prompt to be encoded
+            prompt_2 (`str` or `List[str]`, *optional*):
+                The prompt or prompts to be sent to the `tokenizer_2` and `text_encoder_2`. If not defined, `prompt` is
+                used in both text-encoders
+            device: (`torch.device`):
+                torch device
+            num_images_per_prompt (`int`):
+                number of images that should be generated per prompt
+            do_classifier_free_guidance (`bool`):
+                whether to use classifier free guidance or not
+            negative_prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts not to guide the image generation. If not defined, one has to pass
+                `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `guidance_scale` is
+                less than `1`).
+            negative_prompt_2 (`str` or `List[str]`, *optional*):
+                The prompt or prompts not to guide the image generation to be sent to `tokenizer_2` and
+                `text_encoder_2`. If not defined, `negative_prompt` is used in both text-encoders
+            prompt_embeds (`torch.FloatTensor`, *optional*):
+                Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
+                provided, text embeddings will be generated from `prompt` input argument.
+            negative_prompt_embeds (`torch.FloatTensor`, *optional*):
+                Pre-generated negative text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
+                weighting. If not provided, negative_prompt_embeds will be generated from `negative_prompt` input
+                argument.
+            pooled_prompt_embeds (`torch.FloatTensor`, *optional*):
+                Pre-generated pooled text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting.
+                If not provided, pooled text embeddings will be generated from `prompt` input argument.
+            negative_pooled_prompt_embeds (`torch.FloatTensor`, *optional*):
+                Pre-generated negative pooled text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
+                weighting. If not provided, pooled negative_prompt_embeds will be generated from `negative_prompt`
+                input argument.
+            lora_scale (`float`, *optional*):
+                A lora scale that will be applied to all LoRA layers of the text encoder if LoRA layers are loaded.
+            clip_skip (`int`, *optional*):
+                Number of layers to be skipped from CLIP while computing the prompt embeddings. A value of 1 means that
+                the output of the pre-final layer will be used for computing the prompt embeddings.
+        """
+        device = device or self._execution_device
+
+        # # set lora scale so that monkey patched LoRA
+        # # function of text encoder can correctly access it
+        # if lora_scale is not None and isinstance(self, StableDiffusionXLLoraLoaderMixin):
+        #     self._lora_scale = lora_scale
+
+        #     # dynamically adjust the LoRA scale
+        #     if self.text_encoder is not None:
+        #         if not USE_PEFT_BACKEND:
+        #             adjust_lora_scale_text_encoder(self.text_encoder, lora_scale)
+        #         else:
+        #             scale_lora_layers(self.text_encoder, lora_scale)
+
+        #     if self.text_encoder_2 is not None:
+        #         if not USE_PEFT_BACKEND:
+        #             adjust_lora_scale_text_encoder(self.text_encoder_2, lora_scale)
+        #         else:
+        #             scale_lora_layers(self.text_encoder_2, lora_scale)
+
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+
+        if prompt is not None:
+            batch_size = len(prompt)
+        else:
+            batch_size = prompt_embeds.shape[0]
+
+        # Define tokenizers and text encoders
+        tokenizers = [self.tokenizer, self.tokenizer_2] if self.tokenizer is not None else [self.tokenizer_2]
+        text_encoders = (
+            [self.text_encoder, self.text_encoder_2] if self.text_encoder is not None else [self.text_encoder_2]
+        )
+
+        if prompt_embeds is None:
+            prompt_2 = prompt_2 or prompt
+            prompt_2 = [prompt_2] if isinstance(prompt_2, str) else prompt_2
+
+            # textual inversion: procecss multi-vector tokens if necessary
+            prompt_embeds_list = []
+            prompts = [prompt, prompt_2]
+            for prompt, tokenizer, text_encoder in zip(prompts, tokenizers, text_encoders):
+                # if isinstance(self, TextualInversionLoaderMixin):
+                #     prompt = self.maybe_convert_prompt(prompt, tokenizer)
+
+                text_inputs = tokenizer(
+                    prompt,
+                    padding="max_length",
+                    max_length=tokenizer.model_max_length,
+                    truncation=True,
+                    return_tensors="pt",
+                )
+
+                text_input_ids = text_inputs.input_ids
+                untruncated_ids = tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+
+                if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
+                    text_input_ids, untruncated_ids
+                ):
+                    removed_text = tokenizer.batch_decode(untruncated_ids[:, tokenizer.model_max_length - 1 : -1])
+                    logger.warning(
+                        "The following part of your input was truncated because CLIP can only handle sequences up to"
+                        f" {tokenizer.model_max_length} tokens: {removed_text}"
+                    )
+
+                prompt_embeds = text_encoder(text_input_ids.to(device), output_hidden_states=True)
+
+                # We are only ALWAYS interested in the pooled output of the final text encoder
+                pooled_prompt_embeds = prompt_embeds[0]
+                if clip_skip is None:
+                    prompt_embeds = prompt_embeds.hidden_states[-2]
+                else:
+                    # "2" because SDXL always indexes from the penultimate layer.
+                    prompt_embeds = prompt_embeds.hidden_states[-(clip_skip + 2)]
+
+                prompt_embeds_list.append(prompt_embeds)
+
+            prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
+
+        # get unconditional embeddings for classifier free guidance
+        # zero_out_negative_prompt = negative_prompt is None and self.config.force_zeros_for_empty_prompt
+        zero_out_negative_prompt = False
+        if do_classifier_free_guidance and negative_prompt_embeds is None and zero_out_negative_prompt:
+            negative_prompt_embeds = torch.zeros_like(prompt_embeds)
+            negative_pooled_prompt_embeds = torch.zeros_like(pooled_prompt_embeds)
+        elif do_classifier_free_guidance and negative_prompt_embeds is None:
+            negative_prompt = negative_prompt or ""
+            negative_prompt_2 = negative_prompt_2 or negative_prompt
+
+            # normalize str to list
+            negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+            negative_prompt_2 = (
+                batch_size * [negative_prompt_2] if isinstance(negative_prompt_2, str) else negative_prompt_2
+            )
+
+            uncond_tokens: List[str]
+            if prompt is not None and type(prompt) is not type(negative_prompt):
+                raise TypeError(
+                    f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
+                    f" {type(prompt)}."
+                )
+            elif batch_size != len(negative_prompt):
+                raise ValueError(
+                    f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
+                    f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
+                    " the batch size of `prompt`."
+                )
+            else:
+                uncond_tokens = [negative_prompt, negative_prompt_2]
+
+            negative_prompt_embeds_list = []
+            for negative_prompt, tokenizer, text_encoder in zip(uncond_tokens, tokenizers, text_encoders):
+                # if isinstance(self, TextualInversionLoaderMixin):
+                #     negative_prompt = self.maybe_convert_prompt(negative_prompt, tokenizer)
+
+                max_length = prompt_embeds.shape[1]
+                uncond_input = tokenizer(
+                    negative_prompt,
+                    padding="max_length",
+                    max_length=max_length,
+                    truncation=True,
+                    return_tensors="pt",
+                )
+
+                negative_prompt_embeds = text_encoder(
+                    uncond_input.input_ids.to(device),
+                    output_hidden_states=True,
+                )
+                # We are only ALWAYS interested in the pooled output of the final text encoder
+                negative_pooled_prompt_embeds = negative_prompt_embeds[0]
+                negative_prompt_embeds = negative_prompt_embeds.hidden_states[-2]
+
+                negative_prompt_embeds_list.append(negative_prompt_embeds)
+
+            negative_prompt_embeds = torch.concat(negative_prompt_embeds_list, dim=-1)
+
+        prompt_embeds = prompt_embeds.to(dtype=self.text_encoder_2.dtype, device=device)
+        # if self.text_encoder_2 is not None:
+        # else:
+        #     prompt_embeds = prompt_embeds.to(dtype=self.unet.dtype, device=device)
+
+        bs_embed, seq_len, _ = prompt_embeds.shape
+        # duplicate text embeddings for each generation per prompt, using mps friendly method
+        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+        prompt_embeds = prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
+
+        if do_classifier_free_guidance:
+            # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
+            seq_len = negative_prompt_embeds.shape[1]
+
+            negative_prompt_embeds = negative_prompt_embeds.to(dtype=self.unet.dtype, device=device)
+            # if self.text_encoder_2 is not None:
+            #     negative_prompt_embeds = negative_prompt_embeds.to(dtype=self.text_encoder_2.dtype, device=device)
+            # else:
+            #     negative_prompt_embeds = negative_prompt_embeds.to(dtype=self.unet.dtype, device=device)
+
+            negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_images_per_prompt, 1)
+            negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+
+        pooled_prompt_embeds = pooled_prompt_embeds.repeat(1, num_images_per_prompt).view(
+            bs_embed * num_images_per_prompt, -1
+        )
+        if do_classifier_free_guidance:
+            negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.repeat(1, num_images_per_prompt).view(
+                bs_embed * num_images_per_prompt, -1
+            )
+
+        # if self.text_encoder is not None:
+        #     if isinstance(self, StableDiffusionXLLoraLoaderMixin) and USE_PEFT_BACKEND:
+        #         # Retrieve the original scale by scaling back the LoRA layers
+        #         unscale_lora_layers(self.text_encoder, lora_scale)
+
+        # if self.text_encoder_2 is not None:
+        #     if isinstance(self, StableDiffusionXLLoraLoaderMixin) and USE_PEFT_BACKEND:
+        #         # Retrieve the original scale by scaling back the LoRA layers
+        #         unscale_lora_layers(self.text_encoder_2, lora_scale)
+
+        return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
+
+    def prepare_mask_latents(
+        self, mask, masked_image, batch_size, height, width, dtype, device, generator, do_classifier_free_guidance
+    ):
+        # resize the mask to latents shape as we concatenate the mask to the latents
+        # we do that before converting to dtype to avoid breaking in case we're using cpu_offload
+        # and half precision
+        mask = torch.nn.functional.interpolate(
+            mask, size=(height // self.vae_scale_factor, width // self.vae_scale_factor)
+        )
+        mask = mask.to(device=device, dtype=dtype)
+
+        # duplicate mask and masked_image_latents for each generation per prompt, using mps friendly method
+        if mask.shape[0] < batch_size:
+            if not batch_size % mask.shape[0] == 0:
+                raise ValueError(
+                    "The passed mask and the required batch size don't match. Masks are supposed to be duplicated to"
+                    f" a total batch size of {batch_size}, but {mask.shape[0]} masks were passed. Make sure the number"
+                    " of masks that you pass is divisible by the total requested batch size."
+                )
+            mask = mask.repeat(batch_size // mask.shape[0], 1, 1, 1)
+
+        mask = torch.cat([mask] * 2) if do_classifier_free_guidance else mask
+        if masked_image is not None and masked_image.shape[1] == 4:
+            masked_image_latents = masked_image
+        else:
+            masked_image_latents = None
+
+        if masked_image is not None:
+            if masked_image_latents is None:
+                masked_image = masked_image.to(device=device, dtype=dtype)
+                masked_image_latents = self._encode_vae_image(masked_image, generator=generator)
+
+            if masked_image_latents.shape[0] < batch_size:
+                if not batch_size % masked_image_latents.shape[0] == 0:
+                    raise ValueError(
+                        "The passed images and the required batch size don't match. Images are supposed to be duplicated"
+                        f" to a total batch size of {batch_size}, but {masked_image_latents.shape[0]} images were passed."
+                        " Make sure the number of images that you pass is divisible by the total requested batch size."
+                    )
+                masked_image_latents = masked_image_latents.repeat(
+                    batch_size // masked_image_latents.shape[0], 1, 1, 1
+                )
+
+            masked_image_latents = (
+                torch.cat([masked_image_latents] * 2) if do_classifier_free_guidance else masked_image_latents
+            )
+
+            # aligning device to prevent device errors when concating it with the latent model input
+            masked_image_latents = masked_image_latents.to(device=device, dtype=dtype)
+
+        return mask, masked_image_latents
+
+    def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
+        dtype = image.dtype
+        if self.vae.config.force_upcast:
+            image = image.float()
+            self.vae.to(dtype=torch.float32)
+
+        if isinstance(generator, list):
+            image_latents = [
+                retrieve_latents(self.vae.encode(image[i : i + 1]), generator=generator[i])
+                for i in range(image.shape[0])
+            ]
+            image_latents = torch.cat(image_latents, dim=0)
+        else:
+            image_latents = retrieve_latents(self.vae.encode(image), generator=generator)
+
+        if self.vae.config.force_upcast:
+            self.vae.to(dtype)
+
+        image_latents = image_latents.to(dtype)
+        image_latents = self.vae.config.scaling_factor * image_latents
+
+        return image_latents
+
+    def encode_image(self, image, device, num_images_per_prompt, output_hidden_states=None):
+        dtype = next(self.image_encoder.parameters()).dtype
+        # print(image.shape)
+        if not isinstance(image, torch.Tensor):
+            image = self.feature_extractor(image, return_tensors="pt").pixel_values
+
+        image = image.to(device=device, dtype=dtype)
+        if output_hidden_states:
+            image_enc_hidden_states = self.image_encoder(image, output_hidden_states=True).hidden_states[-2]
+            image_enc_hidden_states = image_enc_hidden_states.repeat_interleave(num_images_per_prompt, dim=0)
+            uncond_image_enc_hidden_states = self.image_encoder(
+                torch.zeros_like(image), output_hidden_states=True
+            ).hidden_states[-2]
+            uncond_image_enc_hidden_states = uncond_image_enc_hidden_states.repeat_interleave(
+                num_images_per_prompt, dim=0
+            )
+            return image_enc_hidden_states, uncond_image_enc_hidden_states
+        else:
+            image_embeds = self.image_encoder(image).image_embeds
+            image_embeds = image_embeds.repeat_interleave(num_images_per_prompt, dim=0)
+            uncond_image_embeds = torch.zeros_like(image_embeds)
+
+            return image_embeds, uncond_image_embeds
+
+    def _get_add_time_ids(
+        self,
+        original_size,
+        crops_coords_top_left,
+        target_size,
+        aesthetic_score,
+        negative_aesthetic_score,
+        negative_original_size,
+        negative_crops_coords_top_left,
+        negative_target_size,
+        dtype,
+        text_encoder_projection_dim=None,
+        unet_config_addition_time_embed_dim=256,
+        unet_add_embedding_linear_1_in_features=2816
+    ):
+        # if self.config.requires_aesthetics_score:
+        #     add_time_ids = list(original_size + crops_coords_top_left + (aesthetic_score,))
+        #     add_neg_time_ids = list(
+        #         negative_original_size + negative_crops_coords_top_left + (negative_aesthetic_score,)
+        #     )
+        # else:
+        add_time_ids = list(original_size + crops_coords_top_left + target_size)
+        add_neg_time_ids = list(negative_original_size + crops_coords_top_left + negative_target_size)
+
+        # passed_add_embed_dim = (
+        #     self.unet.config.addition_time_embed_dim * len(add_time_ids) + text_encoder_projection_dim
+        # )
+        passed_add_embed_dim = (
+            unet_config_addition_time_embed_dim * len(add_time_ids) + text_encoder_projection_dim
+        )
+        # expected_add_embed_dim = self.unet.add_embedding.linear_1.in_features
+        expected_add_embed_dim = unet_add_embedding_linear_1_in_features
+
+        # if (
+        #     expected_add_embed_dim > passed_add_embed_dim
+        #     and (expected_add_embed_dim - passed_add_embed_dim) == self.unet.config.addition_time_embed_dim
+        # ):
+        if (
+            expected_add_embed_dim > passed_add_embed_dim
+            and (expected_add_embed_dim - passed_add_embed_dim) == unet_config_addition_time_embed_dim
+        ):
+            raise ValueError(
+                f"Model expects an added time embedding vector of length {expected_add_embed_dim}, but a vector of {passed_add_embed_dim} was created. Please make sure to enable `requires_aesthetics_score` with `pipe.register_to_config(requires_aesthetics_score=True)` to make sure `aesthetic_score` {aesthetic_score} and `negative_aesthetic_score` {negative_aesthetic_score} is correctly used by the model."
+            )
+        elif (
+            expected_add_embed_dim < passed_add_embed_dim
+            and (passed_add_embed_dim - expected_add_embed_dim) == unet_config_addition_time_embed_dim
+        ):
+            raise ValueError(
+                f"Model expects an added time embedding vector of length {expected_add_embed_dim}, but a vector of {passed_add_embed_dim} was created. Please make sure to disable `requires_aesthetics_score` with `pipe.register_to_config(requires_aesthetics_score=False)` to make sure `target_size` {target_size} is correctly used by the model."
+            )
+        elif expected_add_embed_dim != passed_add_embed_dim:
+            raise ValueError(
+                f"Model expects an added time embedding vector of length {expected_add_embed_dim}, but a vector of {passed_add_embed_dim} was created. The model has an incorrect config. Please check `unet.config.time_embedding_type` and `text_encoder_2.config.projection_dim`."
+            )
+
+        add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
+        add_neg_time_ids = torch.tensor([add_neg_time_ids], dtype=dtype)
+
+        return add_time_ids, add_neg_time_ids

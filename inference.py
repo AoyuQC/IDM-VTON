@@ -26,13 +26,14 @@ import torch
 from PIL import Image
 import torch.nn.functional as F
 import transformers
+from torchvision import transforms
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from packaging import version
-from torchvision import transforms
 import diffusers
 from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, StableDiffusionXLControlNetInpaintPipeline
+
 from transformers import AutoTokenizer, PretrainedConfig,CLIPImageProcessor, CLIPVisionModelWithProjection,CLIPTextModelWithProjection, CLIPTextModel, CLIPTokenizer
 
 from diffusers.utils.import_utils import is_xformers_available
@@ -41,11 +42,55 @@ from src.unet_hacked_tryon import UNet2DConditionModel
 from src.unet_hacked_garmnet import UNet2DConditionModel as UNet2DConditionModel_ref
 from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
 
+# # debug settings
+# change settings between a10 and a100
+import torch
+import sys
+import os
+user = os.environ.get('USER')
 
+print(f"current user is {user}")
+
+device_name = torch.cuda.get_device_name()
+if device_name == 'NVIDIA A10G':
+    # g5 instance
+    if user == "aoyu":
+        try:
+            import debugpy
+
+            debugpy.listen(5889)  # 5678 is port
+            print("Waiting for debugger attach")
+            debugpy.wait_for_client()
+            debugpy.breakpoint()
+            print('break on this line')
+        except Exception as e:
+            print(f"non debug mode {e}")
+        sys.path.append(r'/home/ubuntu/pytorch_gpu_base_ubuntu_uw2_workplace/aws-gcr-csdc-atl/aigc-vto-models/aigc-vto-models-ootd/reference/OOTDiffusion/ootd')
+        # ootd_base_path = "/home/ubuntu/dataset/hf_cache/hub/models--levihsu--OOTDiffusion/snapshots/c79f9dd0585743bea82a39261cc09a24040bc4f9/checkpoints/ootd"
+        # vit_base_path = "/home/ubuntu/dataset/hf_cache/hub/models--openai--clip-vit-large-patch14/snapshots/32bd64288804d66eefd0ccbe215aa642df71cc41"
+    elif user == "xiaoyu":
+        try:
+            import debugpy
+
+            debugpy.listen(5889)  # 5678 is port
+            print("Waiting for debugger attach")
+            debugpy.wait_for_client()
+            debugpy.breakpoint()
+            print('break on this line')
+        except:
+            print("non debug mode")
+        sys.path.append(r'/home/ubuntu/VTO/OOTDiffusion/ootd')
+        ootd_base_path = "/home/ubuntu/VTO/OOTDiffusion/checkpoints/ootd"
+        vit_base_path = "/home/ubuntu/VTO/OOTDiffusion/checkpoints/clip-vit-large-patch14"
+elif device_name == 'NVIDIA A100-SXM4-40GB':
+    # a100 instance
+    sys.path.append(r'/home/ec2-user/SageMaker/vto/OOTDiffusion/ootd')
+    ootd_base_path = "/home/ec2-user/SageMaker/hf_cache/hub/models--levihsu--OOTDiffusion/snapshots/c79f9dd0585743bea82a39261cc09a24040bc4f9/checkpoints/ootd"
+    vit_base_path = "/home/ec2-user/SageMaker/hf_cache/hub/models--openai--clip-vit-large-patch14/snapshots/32bd64288804d66eefd0ccbe215aa642df71cc41"
+else:
+    raise Exception("only for a10 and a100 instance")
 
 logger = get_logger(__name__, log_level="INFO")
-
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -237,7 +282,7 @@ def main():
     )
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path,
-        subfolder="unet",
+        subfolder="unet_epoch0",
         torch_dtype=torch.float16,
     )
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(
@@ -247,7 +292,7 @@ def main():
     )
     UNet_Encoder = UNet2DConditionModel_ref.from_pretrained(
         args.pretrained_model_name_or_path,
-        subfolder="unet_encoder",
+        subfolder="unet_encoder_epoch0",
         torch_dtype=torch.float16,
     )
     text_encoder_one = CLIPTextModel.from_pretrained(
@@ -287,18 +332,18 @@ def main():
 
     
     
-    if args.enable_xformers_memory_efficient_attention:
-        if is_xformers_available():
-            import xformers
+    # if args.enable_xformers_memory_efficient_attention:
+    #     if is_xformers_available():
+    #         import xformers
 
-            xformers_version = version.parse(xformers.__version__)
-            if xformers_version == version.parse("0.0.16"):
-                logger.warn(
-                    "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
-                )
-            unet.enable_xformers_memory_efficient_attention()
-        else:
-            raise ValueError("xformers is not available. Make sure it is installed correctly")
+    #         xformers_version = version.parse(xformers.__version__)
+    #         if xformers_version == version.parse("0.0.16"):
+    #             logger.warn(
+    #                 "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
+    #             )
+    #         unet.enable_xformers_memory_efficient_attention()
+    #     else:
+    #         raise ValueError("xformers is not available. Make sure it is installed correctly")
 
     test_dataset = VitonHDTestDataset(
         dataroot_path=args.data_dir,
